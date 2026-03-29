@@ -1,321 +1,603 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2021 Ricardo Quesada
-// http://retro.moe/unijoysticle2
 
 #include "sdkconfig.h"
 
 #include <Arduino.h>
 #include <Bluepad32.h>
+#include <Wire.h>
 
-//
-// README FIRST, README FIRST, README FIRST
-//
-// Bluepad32 has a built-in interactive console.
-// By default, it is enabled (hey, this is a great feature!).
-// But it is incompatible with Arduino "Serial" class.
-//
-// Instead of using "Serial" you can use Bluepad32 "Console" class instead.
-// It is somewhat similar to Serial but not exactly the same.
-//
-// Should you want to still use "Serial", you have to disable the Bluepad32's console
-// from "sdkconfig.defaults" with:
-//    CONFIG_BLUEPAD32_USB_CONSOLE_ENABLE=n
+namespace {
 
-ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+constexpr uint8_t kOledAddress = 0x3C;
+constexpr int kOledSdaPin = 21;
+constexpr int kOledSclPin = 22;
+constexpr int kBuzzerPin = 32;
 
-// This callback gets called any time a new gamepad is connected.
-// Up to 4 gamepads can be connected at the same time.
-void onConnectedController(ControllerPtr ctl) {
-    bool foundEmptySlot = false;
-    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
-        if (myControllers[i] == nullptr) {
-            Console.printf("CALLBACK: Controller is connected, index=%d\n", i);
-            // Additionally, you can get certain gamepad properties like:
-            // Model, VID, PID, BTAddr, flags, etc.
-            ControllerProperties properties = ctl->getProperties();
-            Console.printf("Controller model: %s, VID=0x%04x, PID=0x%04x\n", ctl->getModelName(), properties.vendor_id,
-                           properties.product_id);
-            myControllers[i] = ctl;
-            foundEmptySlot = true;
-            break;
+constexpr int kDisplayWidth = 128;
+constexpr int kDisplayHeight = 64;
+constexpr int kPageCount = 8;
+constexpr int kCellSize = 4;
+constexpr int kGridWidth = kDisplayWidth / kCellSize;
+constexpr int kGridHeight = kDisplayHeight / kCellSize;
+constexpr int kMaxSnakeLength = kGridWidth * kGridHeight;
+constexpr uint32_t kStepIntervalMs = 140;
+
+uint8_t gDisplayBuffer[kDisplayWidth * kPageCount];
+ControllerPtr gControllers[BP32_MAX_GAMEPADS];
+
+struct Point {
+    int8_t x;
+    int8_t y;
+};
+
+enum class Direction : uint8_t {
+    Up,
+    Down,
+    Left,
+    Right,
+};
+
+struct SnakeGame {
+    Point body[kMaxSnakeLength];
+    int length = 0;
+    Point food = {0, 0};
+    Direction direction = Direction::Right;
+    Direction pendingDirection = Direction::Right;
+    bool alive = false;
+    bool started = false;
+    uint32_t lastStepMs = 0;
+    uint16_t score = 0;
+};
+
+SnakeGame gGame;
+bool gDisplayReady = false;
+bool gBuzzerReady = false;
+bool gWaitingScreenDirty = true;
+bool gGameOverTonePlayed = false;
+
+constexpr uint8_t glyphFor(char c) {
+    return static_cast<uint8_t>(c);
+}
+
+const uint8_t* getGlyph(char c) {
+    switch (glyphFor(c)) {
+        case 'A': {
+            static const uint8_t glyph[] = {0x1E, 0x05, 0x05, 0x1E, 0x00};
+            return glyph;
+        }
+        case 'C': {
+            static const uint8_t glyph[] = {0x0E, 0x11, 0x11, 0x11, 0x00};
+            return glyph;
+        }
+        case 'E': {
+            static const uint8_t glyph[] = {0x1F, 0x15, 0x15, 0x11, 0x00};
+            return glyph;
+        }
+        case 'G': {
+            static const uint8_t glyph[] = {0x0E, 0x11, 0x15, 0x1D, 0x00};
+            return glyph;
+        }
+        case 'H': {
+            static const uint8_t glyph[] = {0x1F, 0x04, 0x04, 0x1F, 0x00};
+            return glyph;
+        }
+        case 'I': {
+            static const uint8_t glyph[] = {0x11, 0x1F, 0x11, 0x00, 0x00};
+            return glyph;
+        }
+        case 'K': {
+            static const uint8_t glyph[] = {0x1F, 0x04, 0x0A, 0x11, 0x00};
+            return glyph;
+        }
+        case 'L': {
+            static const uint8_t glyph[] = {0x1F, 0x10, 0x10, 0x10, 0x00};
+            return glyph;
+        }
+        case 'M': {
+            static const uint8_t glyph[] = {0x1F, 0x02, 0x04, 0x02, 0x1F};
+            return glyph;
+        }
+        case 'N': {
+            static const uint8_t glyph[] = {0x1F, 0x02, 0x04, 0x1F, 0x00};
+            return glyph;
+        }
+        case 'O': {
+            static const uint8_t glyph[] = {0x0E, 0x11, 0x11, 0x0E, 0x00};
+            return glyph;
+        }
+        case 'P': {
+            static const uint8_t glyph[] = {0x1F, 0x05, 0x05, 0x02, 0x00};
+            return glyph;
+        }
+        case 'R': {
+            static const uint8_t glyph[] = {0x1F, 0x05, 0x0D, 0x12, 0x00};
+            return glyph;
+        }
+        case 'S': {
+            static const uint8_t glyph[] = {0x12, 0x15, 0x15, 0x09, 0x00};
+            return glyph;
+        }
+        case 'T': {
+            static const uint8_t glyph[] = {0x01, 0x1F, 0x01, 0x00, 0x00};
+            return glyph;
+        }
+        case 'W': {
+            static const uint8_t glyph[] = {0x1F, 0x08, 0x04, 0x08, 0x1F};
+            return glyph;
+        }
+        case '0': {
+            static const uint8_t glyph[] = {0x0E, 0x19, 0x15, 0x13, 0x0E};
+            return glyph;
+        }
+        case '1': {
+            static const uint8_t glyph[] = {0x00, 0x12, 0x1F, 0x10, 0x00};
+            return glyph;
+        }
+        case '2': {
+            static const uint8_t glyph[] = {0x12, 0x19, 0x15, 0x12, 0x00};
+            return glyph;
+        }
+        case '3': {
+            static const uint8_t glyph[] = {0x11, 0x15, 0x15, 0x0A, 0x00};
+            return glyph;
+        }
+        case '4': {
+            static const uint8_t glyph[] = {0x07, 0x04, 0x04, 0x1F, 0x04};
+            return glyph;
+        }
+        case '5': {
+            static const uint8_t glyph[] = {0x17, 0x15, 0x15, 0x09, 0x00};
+            return glyph;
+        }
+        case '6': {
+            static const uint8_t glyph[] = {0x0E, 0x15, 0x15, 0x08, 0x00};
+            return glyph;
+        }
+        case '7': {
+            static const uint8_t glyph[] = {0x01, 0x01, 0x1D, 0x03, 0x00};
+            return glyph;
+        }
+        case '8': {
+            static const uint8_t glyph[] = {0x0A, 0x15, 0x15, 0x0A, 0x00};
+            return glyph;
+        }
+        case '9': {
+            static const uint8_t glyph[] = {0x02, 0x15, 0x15, 0x0E, 0x00};
+            return glyph;
+        }
+        case ':': {
+            static const uint8_t glyph[] = {0x00, 0x0A, 0x00, 0x00, 0x00};
+            return glyph;
+        }
+        case ' ': {
+            static const uint8_t glyph[] = {0x00, 0x00, 0x00, 0x00, 0x00};
+            return glyph;
+        }
+        default: {
+            static const uint8_t glyph[] = {0x1F, 0x11, 0x11, 0x1F, 0x00};
+            return glyph;
         }
     }
-    if (!foundEmptySlot) {
-        Console.println("CALLBACK: Controller connected, but could not found empty slot");
-    }
 }
 
-void onDisconnectedController(ControllerPtr ctl) {
-    bool foundController = false;
-
-    for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
-        if (myControllers[i] == ctl) {
-            Console.printf("CALLBACK: Controller disconnected from index=%d\n", i);
-            myControllers[i] = nullptr;
-            foundController = true;
-            break;
-        }
-    }
-
-    if (!foundController) {
-        Console.println("CALLBACK: Controller disconnected, but not found in myControllers");
-    }
+void oledCommand(uint8_t command) {
+    Wire.beginTransmission(kOledAddress);
+    Wire.write(0x00);
+    Wire.write(command);
+    Wire.endTransmission();
 }
 
-void dumpGamepad(ControllerPtr ctl) {
-    Console.printf(
-        "idx=%d, dpad: 0x%02x, buttons: 0x%04x, axis L: %4d, %4d, axis R: %4d, %4d, brake: %4d, throttle: %4d, "
-        "misc: 0x%02x, gyro x:%6d y:%6d z:%6d, accel x:%6d y:%6d z:%6d\n",
-        ctl->index(),        // Controller Index
-        ctl->dpad(),         // D-pad
-        ctl->buttons(),      // bitmask of pressed buttons
-        ctl->axisX(),        // (-511 - 512) left X Axis
-        ctl->axisY(),        // (-511 - 512) left Y axis
-        ctl->axisRX(),       // (-511 - 512) right X axis
-        ctl->axisRY(),       // (-511 - 512) right Y axis
-        ctl->brake(),        // (0 - 1023): brake button
-        ctl->throttle(),     // (0 - 1023): throttle (AKA gas) button
-        ctl->miscButtons(),  // bitmask of pressed "misc" buttons
-        ctl->gyroX(),        // Gyro X
-        ctl->gyroY(),        // Gyro Y
-        ctl->gyroZ(),        // Gyro Z
-        ctl->accelX(),       // Accelerometer X
-        ctl->accelY(),       // Accelerometer Y
-        ctl->accelZ()        // Accelerometer Z
-    );
+void oledData(const uint8_t* data, size_t len) {
+    Wire.beginTransmission(kOledAddress);
+    Wire.write(0x40);
+    for (size_t i = 0; i < len; ++i) {
+        Wire.write(data[i]);
+    }
+    Wire.endTransmission();
 }
 
-void dumpMouse(ControllerPtr ctl) {
-    Console.printf("idx=%d, buttons: 0x%04x, scrollWheel=0x%04x, delta X: %4d, delta Y: %4d\n",
-                   ctl->index(),        // Controller Index
-                   ctl->buttons(),      // bitmask of pressed buttons
-                   ctl->scrollWheel(),  // Scroll Wheel
-                   ctl->deltaX(),       // (-511 - 512) left X Axis
-                   ctl->deltaY()        // (-511 - 512) left Y axis
-    );
+void clearBuffer() {
+    memset(gDisplayBuffer, 0, sizeof(gDisplayBuffer));
 }
 
-void dumpKeyboard(ControllerPtr ctl) {
-    static const char* key_names[] = {
-        // clang-format off
-        // To avoid having too much noise in this file, only a few keys are mapped to strings.
-        // Starts with "A", which is offset 4.
-        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V",
-        "W", "X", "Y", "Z", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
-        // Special keys
-        "Enter", "Escape", "Backspace", "Tab", "Spacebar", "Underscore", "Equal", "OpenBracket", "CloseBracket",
-        "Backslash", "Tilde", "SemiColon", "Quote", "GraveAccent", "Comma", "Dot", "Slash", "CapsLock",
-        // Function keys
-        "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
-        // Cursors and others
-        "PrintScreen", "ScrollLock", "Pause", "Insert", "Home", "PageUp", "Delete", "End", "PageDown",
-        "RightArrow", "LeftArrow", "DownArrow", "UpArrow",
-        // clang-format on
-    };
-    static const char* modifier_names[] = {
-        // clang-format off
-        // From 0xe0 to 0xe7
-        "Left Control", "Left Shift", "Left Alt", "Left Meta",
-        "Right Control", "Right Shift", "Right Alt", "Right Meta",
-        // clang-format on
-    };
-    Console.printf("idx=%d, Pressed keys: ", ctl->index());
-    for (int key = Keyboard_A; key <= Keyboard_UpArrow; key++) {
-        if (ctl->isKeyPressed(static_cast<KeyboardKey>(key))) {
-            const char* keyName = key_names[key - 4];
-            Console.printf("%s,", keyName);
-        }
-    }
-    for (int key = Keyboard_LeftControl; key <= Keyboard_RightMeta; key++) {
-        if (ctl->isKeyPressed(static_cast<KeyboardKey>(key))) {
-            const char* keyName = modifier_names[key - 0xe0];
-            Console.printf("%s,", keyName);
-        }
-    }
-    Console.printf("\n");
-}
-
-void dumpBalanceBoard(ControllerPtr ctl) {
-    Console.printf("idx=%d,  TL=%u, TR=%u, BL=%u, BR=%u, temperature=%d\n",
-                   ctl->index(),        // Controller Index
-                   ctl->topLeft(),      // top-left scale
-                   ctl->topRight(),     // top-right scale
-                   ctl->bottomLeft(),   // bottom-left scale
-                   ctl->bottomRight(),  // bottom-right scale
-                   ctl->temperature()   // temperature: used to adjust the scale value's precision
-    );
-}
-
-void processGamepad(ControllerPtr ctl) {
-    // There are different ways to query whether a button is pressed.
-    // By query each button individually:
-    //  a(), b(), x(), y(), l1(), etc...
-    if (ctl->a()) {
-        static int colorIdx = 0;
-        // Some gamepads like DS4 and DualSense support changing the color LED.
-        // It is possible to change it by calling:
-        switch (colorIdx % 3) {
-            case 0:
-                // Red
-                ctl->setColorLED(255, 0, 0);
-                break;
-            case 1:
-                // Green
-                ctl->setColorLED(0, 255, 0);
-                break;
-            case 2:
-                // Blue
-                ctl->setColorLED(0, 0, 255);
-                break;
-        }
-        colorIdx++;
-    }
-
-    if (ctl->b()) {
-        // Turn on the 4 LED. Each bit represents one LED.
-        static int led = 0;
-        led++;
-        // Some gamepads like the DS3, DualSense, Nintendo Wii, Nintendo Switch
-        // support changing the "Player LEDs": those 4 LEDs that usually indicate
-        // the "gamepad seat".
-        // It is possible to change them by calling:
-        ctl->setPlayerLEDs(led & 0x0f);
-    }
-
-    if (ctl->x()) {
-        // Some gamepads like DS3, DS4, DualSense, Switch, Xbox One S, Stadia support rumble.
-        // It is possible to set it by calling:
-        // Some controllers have two motors: "strong motor", "weak motor".
-        // It is possible to control them independently.
-        ctl->playDualRumble(0 /* delayedStartMs */, 250 /* durationMs */, 0x80 /* weakMagnitude */,
-                            0x40 /* strongMagnitude */);
-    }
-
-    // Another way to query controller data is by getting the buttons() function.
-    // See how the different "dump*" functions dump the Controller info.
-    dumpGamepad(ctl);
-
-    // See ArduinoController.h for all the available functions.
-}
-
-void processMouse(ControllerPtr ctl) {
-    // This is just an example.
-    if (ctl->scrollWheel() > 0) {
-        // Do Something
-    } else if (ctl->scrollWheel() < 0) {
-        // Do something else
-    }
-
-    // See "dumpMouse" for possible things to query.
-    dumpMouse(ctl);
-}
-
-void processKeyboard(ControllerPtr ctl) {
-    if (!ctl->isAnyKeyPressed())
+void drawPixel(int x, int y, bool on = true) {
+    if (x < 0 || x >= kDisplayWidth || y < 0 || y >= kDisplayHeight) {
         return;
-
-    // This is just an example.
-    if (ctl->isKeyPressed(Keyboard_A)) {
-        // Do Something
-        Console.println("Key 'A' pressed");
     }
-
-    // Don't do "else" here.
-    // Multiple keys can be pressed at the same time.
-    if (ctl->isKeyPressed(Keyboard_LeftShift)) {
-        // Do something else
-        Console.println("Key 'LEFT SHIFT' pressed");
+    const int index = x + (y / 8) * kDisplayWidth;
+    const uint8_t mask = 1U << (y & 7);
+    if (on) {
+        gDisplayBuffer[index] |= mask;
+    } else {
+        gDisplayBuffer[index] &= ~mask;
     }
-
-    // Don't do "else" here.
-    // Multiple keys can be pressed at the same time.
-    if (ctl->isKeyPressed(Keyboard_LeftArrow)) {
-        // Do something else
-        Console.println("Key 'Left Arrow' pressed");
-    }
-
-    // See "dumpKeyboard" for possible things to query.
-    dumpKeyboard(ctl);
 }
 
-void processBalanceBoard(ControllerPtr ctl) {
-    // This is just an example.
-    if (ctl->topLeft() > 10000) {
-        // Do Something
+void fillRect(int x, int y, int w, int h, bool on = true) {
+    for (int dy = 0; dy < h; ++dy) {
+        for (int dx = 0; dx < w; ++dx) {
+            drawPixel(x + dx, y + dy, on);
+        }
     }
-
-    // See "dumpBalanceBoard" for possible things to query.
-    dumpBalanceBoard(ctl);
 }
 
-void processControllers() {
-    for (auto myController : myControllers) {
-        if (myController && myController->isConnected() && myController->hasData()) {
-            if (myController->isGamepad()) {
-                processGamepad(myController);
-            } else if (myController->isMouse()) {
-                processMouse(myController);
-            } else if (myController->isKeyboard()) {
-                processKeyboard(myController);
-            } else if (myController->isBalanceBoard()) {
-                processBalanceBoard(myController);
-            } else {
-                Console.printf("Unsupported controller\n");
+void drawRect(int x, int y, int w, int h) {
+    for (int dx = 0; dx < w; ++dx) {
+        drawPixel(x + dx, y);
+        drawPixel(x + dx, y + h - 1);
+    }
+    for (int dy = 0; dy < h; ++dy) {
+        drawPixel(x, y + dy);
+        drawPixel(x + w - 1, y + dy);
+    }
+}
+
+void drawChar(int x, int y, char c, uint8_t scale = 1) {
+    const uint8_t* glyph = getGlyph(c);
+    for (int col = 0; col < 5; ++col) {
+        const uint8_t bits = glyph[col];
+        for (int row = 0; row < 7; ++row) {
+            if (bits & (1U << row)) {
+                fillRect(x + col * scale, y + row * scale, scale, scale);
             }
         }
     }
 }
 
-// Arduino setup function. Runs in CPU 1
+void drawText(int x, int y, const char* text, uint8_t scale = 1) {
+    while (*text) {
+        drawChar(x, y, *text, scale);
+        x += 6 * scale;
+        ++text;
+    }
+}
+
+void flushDisplay() {
+    for (uint8_t page = 0; page < kPageCount; ++page) {
+        oledCommand(0xB0 + page);
+        oledCommand(0x02);
+        oledCommand(0x10);
+        oledData(&gDisplayBuffer[page * kDisplayWidth], kDisplayWidth);
+    }
+}
+
+void initDisplay() {
+    Wire.begin(kOledSdaPin, kOledSclPin);
+    delay(50);
+
+    oledCommand(0xAE);
+    oledCommand(0xD5);
+    oledCommand(0x80);
+    oledCommand(0xA8);
+    oledCommand(0x3F);
+    oledCommand(0xD3);
+    oledCommand(0x00);
+    oledCommand(0x40);
+    oledCommand(0xAD);
+    oledCommand(0x8B);
+    oledCommand(0xA1);
+    oledCommand(0xC8);
+    oledCommand(0xDA);
+    oledCommand(0x12);
+    oledCommand(0x81);
+    oledCommand(0x7F);
+    oledCommand(0xD9);
+    oledCommand(0x22);
+    oledCommand(0xDB);
+    oledCommand(0x20);
+    oledCommand(0xA4);
+    oledCommand(0xA6);
+    oledCommand(0xAF);
+
+    clearBuffer();
+    flushDisplay();
+    gDisplayReady = true;
+}
+
+void initBuzzer() {
+    gBuzzerReady = ledcAttach(kBuzzerPin, 2000, 10);
+    if (gBuzzerReady) {
+        ledcWriteTone(kBuzzerPin, 0);
+    }
+}
+
+void beep(uint16_t freq, uint16_t durationMs) {
+    if (!gBuzzerReady) {
+        return;
+    }
+    ledcWriteTone(kBuzzerPin, freq);
+    delay(durationMs);
+    ledcWriteTone(kBuzzerPin, 0);
+}
+
+ControllerPtr activeGamepad() {
+    for (auto controller : gControllers) {
+        if (controller && controller->isConnected() && controller->isGamepad()) {
+            return controller;
+        }
+    }
+    return nullptr;
+}
+
+bool isOpposite(Direction a, Direction b) {
+    return (a == Direction::Up && b == Direction::Down) || (a == Direction::Down && b == Direction::Up) ||
+           (a == Direction::Left && b == Direction::Right) || (a == Direction::Right && b == Direction::Left);
+}
+
+bool pointEquals(const Point& a, const Point& b) {
+    return a.x == b.x && a.y == b.y;
+}
+
+bool snakeOccupies(const Point& p, int length) {
+    for (int i = 0; i < length; ++i) {
+        if (pointEquals(gGame.body[i], p)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void spawnFood() {
+    const uint32_t start = millis();
+    Point candidate{};
+    do {
+        candidate.x = random(0, kGridWidth);
+        candidate.y = random(0, kGridHeight);
+    } while (snakeOccupies(candidate, gGame.length) && millis() - start < 1000);
+    gGame.food = candidate;
+}
+
+void resetGame() {
+    gGame.length = 4;
+    gGame.body[0] = {12, 8};
+    gGame.body[1] = {11, 8};
+    gGame.body[2] = {10, 8};
+    gGame.body[3] = {9, 8};
+    gGame.direction = Direction::Right;
+    gGame.pendingDirection = Direction::Right;
+    gGame.alive = true;
+    gGame.started = false;
+    gGame.lastStepMs = millis();
+    gGame.score = 0;
+    gGameOverTonePlayed = false;
+    spawnFood();
+}
+
+void drawCell(const Point& p, bool filled) {
+    const int x = p.x * kCellSize;
+    const int y = p.y * kCellSize;
+    if (filled) {
+        fillRect(x, y, kCellSize, kCellSize);
+    } else {
+        drawRect(x, y, kCellSize, kCellSize);
+    }
+}
+
+void renderWaitingScreen() {
+    clearBuffer();
+    drawRect(0, 0, kDisplayWidth, kDisplayHeight);
+    drawText(13, 14, "AWAITING", 2);
+    drawText(7, 34, "CONTROLLER", 2);
+    drawText(28, 56, "SNAKE", 1);
+    flushDisplay();
+}
+
+void renderGame() {
+    clearBuffer();
+
+    for (int x = 0; x < kDisplayWidth; ++x) {
+        drawPixel(x, 0);
+        drawPixel(x, kDisplayHeight - 1);
+    }
+    for (int y = 0; y < kDisplayHeight; ++y) {
+        drawPixel(0, y);
+        drawPixel(kDisplayWidth - 1, y);
+    }
+
+    drawText(4, 2, "S:");
+    char scoreText[8];
+    snprintf(scoreText, sizeof(scoreText), "%u", gGame.score);
+    drawText(18, 2, scoreText);
+
+    drawCell(gGame.food, true);
+
+    for (int i = gGame.length - 1; i >= 0; --i) {
+        drawCell(gGame.body[i], i == 0);
+    }
+
+    if (!gGame.alive) {
+        fillRect(14, 22, 100, 20, false);
+        drawText(22, 26, "GAME", 2);
+        drawText(70, 26, "OVER", 2);
+        drawText(20, 48, "A TO RESTART", 1);
+    } else if (!gGame.started) {
+        drawText(18, 56, "PRESS DPAD", 1);
+    }
+
+    flushDisplay();
+}
+
+void drawWaitingIfNeeded() {
+    if (!gDisplayReady || !gWaitingScreenDirty) {
+        return;
+    }
+    renderWaitingScreen();
+    gWaitingScreenDirty = false;
+}
+
+void onConnectedController(ControllerPtr ctl) {
+    for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
+        if (gControllers[i] == nullptr) {
+            ControllerProperties properties = ctl->getProperties();
+            Console.printf("Controller connected, index=%d, VID=0x%04x, PID=0x%04x\n", i, properties.vendor_id,
+                           properties.product_id);
+            gControllers[i] = ctl;
+            gWaitingScreenDirty = true;
+            beep(1760, 60);
+            return;
+        }
+    }
+    Console.println("Controller connected, but there are no free slots");
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+    for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
+        if (gControllers[i] == ctl) {
+            Console.printf("Controller disconnected from index=%d\n", i);
+            gControllers[i] = nullptr;
+            gWaitingScreenDirty = true;
+            resetGame();
+            beep(220, 180);
+            return;
+        }
+    }
+}
+
+void updateDirectionFromController(ControllerPtr ctl) {
+    if (!ctl) {
+        return;
+    }
+
+    Direction candidate = gGame.pendingDirection;
+    const int axisX = ctl->axisX();
+    const int axisY = ctl->axisY();
+
+    if (ctl->dpad() & DPAD_UP || axisY < -300) {
+        candidate = Direction::Up;
+    } else if (ctl->dpad() & DPAD_DOWN || axisY > 300) {
+        candidate = Direction::Down;
+    } else if (ctl->dpad() & DPAD_LEFT || axisX < -300) {
+        candidate = Direction::Left;
+    } else if (ctl->dpad() & DPAD_RIGHT || axisX > 300) {
+        candidate = Direction::Right;
+    }
+
+    if (!isOpposite(candidate, gGame.direction)) {
+        gGame.pendingDirection = candidate;
+    }
+
+    if (!gGame.started && candidate != gGame.direction) {
+        gGame.started = true;
+    }
+    if (!gGame.started && (ctl->dpad() != 0 || abs(axisX) > 300 || abs(axisY) > 300)) {
+        gGame.started = true;
+    }
+}
+
+void stepGame() {
+    if (!gGame.alive || !gGame.started) {
+        return;
+    }
+
+    gGame.direction = gGame.pendingDirection;
+    Point next = gGame.body[0];
+    switch (gGame.direction) {
+        case Direction::Up:
+            --next.y;
+            break;
+        case Direction::Down:
+            ++next.y;
+            break;
+        case Direction::Left:
+            --next.x;
+            break;
+        case Direction::Right:
+            ++next.x;
+            break;
+    }
+
+    if (next.x < 0 || next.x >= kGridWidth || next.y < 0 || next.y >= kGridHeight) {
+        gGame.alive = false;
+        return;
+    }
+
+    for (int i = 0; i < gGame.length; ++i) {
+        if (pointEquals(next, gGame.body[i])) {
+            gGame.alive = false;
+            return;
+        }
+    }
+
+    const bool ateFood = pointEquals(next, gGame.food);
+    const int newLength = min(gGame.length + (ateFood ? 1 : 0), kMaxSnakeLength);
+    for (int i = newLength - 1; i > 0; --i) {
+        gGame.body[i] = gGame.body[i - 1];
+    }
+    gGame.body[0] = next;
+    gGame.length = newLength;
+
+    if (ateFood) {
+        ++gGame.score;
+        spawnFood();
+        beep(1320, 35);
+    }
+}
+
+void handleGamepadButtons(ControllerPtr ctl) {
+    if (!ctl) {
+        return;
+    }
+
+    if (!gGame.alive && ctl->a()) {
+        resetGame();
+        beep(880, 50);
+        delay(80);
+        beep(1320, 50);
+    }
+}
+
+void runSnakeFrame(ControllerPtr ctl) {
+    updateDirectionFromController(ctl);
+    handleGamepadButtons(ctl);
+
+    const uint32_t now = millis();
+    if (now - gGame.lastStepMs >= kStepIntervalMs) {
+        gGame.lastStepMs = now;
+        stepGame();
+    }
+
+    if (!gGame.alive && !gGameOverTonePlayed) {
+        gGameOverTonePlayed = true;
+        beep(330, 120);
+        delay(40);
+        beep(180, 180);
+    }
+
+    renderGame();
+}
+
+}  // namespace
+
 void setup() {
+    delay(200);
+    randomSeed(esp_random());
+
+    initDisplay();
+    initBuzzer();
+    resetGame();
+
     Console.printf("Firmware: %s\n", BP32.firmwareVersion());
     const uint8_t* addr = BP32.localBdAddress();
     Console.printf("BD Addr: %2X:%2X:%2X:%2X:%2X:%2X\n", addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
-    // Setup the Bluepad32 callbacks, and the default behavior for scanning or not.
-    // By default, if the "startScanning" parameter is not passed, it will do the "start scanning".
-    // Notice that "Start scanning" will try to auto-connect to devices that are compatible with Bluepad32.
-    // E.g: if a Gamepad, keyboard or mouse are detected, it will try to auto connect to them.
-    bool startScanning = true;
-    BP32.setup(&onConnectedController, &onDisconnectedController, startScanning);
-
-    // Notice that scanning can be stopped / started at any time by calling:
-    // BP32.enableNewBluetoothConnections(enabled);
-
-    // "forgetBluetoothKeys()" should be called when the user performs
-    // a "device factory reset", or similar.
-    // Calling "forgetBluetoothKeys" in setup() just as an example.
-    // Forgetting Bluetooth keys prevents "paired" gamepads to reconnect.
-    // But it might also fix some connection / re-connection issues.
-    BP32.forgetBluetoothKeys();
-
-    // Enables mouse / touchpad support for gamepads that support them.
-    // When enabled, controllers like DualSense and DualShock4 generate two connected devices:
-    // - First one: the gamepad
-    // - Second one, which is a "virtual device", is a mouse.
-    // By default, it is disabled.
+    BP32.setup(&onConnectedController, &onDisconnectedController, true);
     BP32.enableVirtualDevice(false);
-
-    // Enables the BLE Service in Bluepad32.
-    // This service allows clients, like a mobile app, to setup and see the state of Bluepad32.
-    // By default, it is disabled.
     BP32.enableBLEService(false);
+
+    renderWaitingScreen();
 }
 
-// Arduino loop function. Runs in CPU 1.
 void loop() {
-    // This call fetches all the controllers' data.
-    // Call this function in your main loop.
-    bool dataUpdated = BP32.update();
-    if (dataUpdated)
-        processControllers();
+    BP32.update();
 
-    // The main loop must have some kind of "yield to lower priority task" event.
-    // Otherwise, the watchdog will get triggered.
-    // If your main loop doesn't have one, just add a simple `vTaskDelay(1)`.
-    // Detailed info here:
-    // https://stackoverflow.com/questions/66278271/task-watchdog-got-triggered-the-tasks-did-not-reset-the-watchdog-in-time
+    ControllerPtr controller = activeGamepad();
+    if (!controller) {
+        drawWaitingIfNeeded();
+        delay(30);
+        return;
+    }
 
-    //     vTaskDelay(1);
-    delay(150);
+    gWaitingScreenDirty = true;
+    runSnakeFrame(controller);
+    delay(20);
 }
