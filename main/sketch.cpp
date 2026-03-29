@@ -17,17 +17,33 @@ constexpr int kDisplayWidth = 128;
 constexpr int kDisplayHeight = 64;
 constexpr int kPageCount = 8;
 constexpr int kCellSize = 4;
-constexpr int kGridWidth = kDisplayWidth / kCellSize;
-constexpr int kGridHeight = kDisplayHeight / kCellSize;
-constexpr int kMaxSnakeLength = kGridWidth * kGridHeight;
-constexpr uint32_t kStepIntervalMs = 140;
+
+constexpr int kSnakeGridWidth = kDisplayWidth / kCellSize;
+constexpr int kSnakeGridHeight = kDisplayHeight / kCellSize;
+constexpr int kMaxSnakeLength = kSnakeGridWidth * kSnakeGridHeight;
+constexpr uint32_t kSnakeStepMs = 140;
+
+constexpr int kTetrisCellSize = 4;
+constexpr int kTetrisBoardWidth = 10;
+constexpr int kTetrisBoardHeight = 14;
+constexpr int kTetrisBoardX = 6;
+constexpr int kTetrisBoardY = 4;
+constexpr uint32_t kTetrisFallMs = 420;
+constexpr uint32_t kTetrisSoftDropMs = 70;
 
 uint8_t gDisplayBuffer[kDisplayWidth * kPageCount];
 ControllerPtr gControllers[BP32_MAX_GAMEPADS];
 
-struct Point {
-    int8_t x;
-    int8_t y;
+enum class Screen : uint8_t {
+    Waiting,
+    Menu,
+    Snake,
+    Tetris,
+};
+
+enum class MenuItem : uint8_t {
+    Snake,
+    Tetris,
 };
 
 enum class Direction : uint8_t {
@@ -35,6 +51,21 @@ enum class Direction : uint8_t {
     Down,
     Left,
     Right,
+};
+
+struct Point {
+    int8_t x;
+    int8_t y;
+};
+
+struct InputState {
+    bool up = false;
+    bool down = false;
+    bool left = false;
+    bool right = false;
+    bool a = false;
+    bool b = false;
+    bool start = false;
 };
 
 struct SnakeGame {
@@ -45,15 +76,47 @@ struct SnakeGame {
     Direction pendingDirection = Direction::Right;
     bool alive = false;
     bool started = false;
+    bool gameOverTonePlayed = false;
     uint32_t lastStepMs = 0;
     uint16_t score = 0;
 };
 
-SnakeGame gGame;
+struct Piece {
+    int8_t type = 0;
+    int8_t rotation = 0;
+    int8_t x = 0;
+    int8_t y = 0;
+};
+
+struct TetrisGame {
+    uint8_t board[kTetrisBoardHeight][kTetrisBoardWidth] = {};
+    Piece piece;
+    bool alive = false;
+    bool started = false;
+    bool gameOverTonePlayed = false;
+    uint32_t score = 0;
+    uint32_t lastFallMs = 0;
+    uint32_t lastSoftDropMs = 0;
+};
+
+Screen gScreen = Screen::Waiting;
+MenuItem gMenuItem = MenuItem::Snake;
+InputState gPreviousInput;
+SnakeGame gSnake;
+TetrisGame gTetris;
 bool gDisplayReady = false;
 bool gBuzzerReady = false;
-bool gWaitingScreenDirty = true;
-bool gGameOverTonePlayed = false;
+bool gScreenDirty = true;
+
+const int8_t kTetrominoes[7][4][4][2] = {
+    {{{0, 1}, {1, 1}, {2, 1}, {3, 1}}, {{2, 0}, {2, 1}, {2, 2}, {2, 3}}, {{0, 2}, {1, 2}, {2, 2}, {3, 2}}, {{1, 0}, {1, 1}, {1, 2}, {1, 3}}},
+    {{{0, 0}, {0, 1}, {1, 1}, {2, 1}}, {{1, 0}, {2, 0}, {1, 1}, {1, 2}}, {{0, 1}, {1, 1}, {2, 1}, {2, 2}}, {{1, 0}, {1, 1}, {0, 2}, {1, 2}}},
+    {{{2, 0}, {0, 1}, {1, 1}, {2, 1}}, {{1, 0}, {1, 1}, {1, 2}, {2, 2}}, {{0, 1}, {1, 1}, {2, 1}, {0, 2}}, {{0, 0}, {1, 0}, {1, 1}, {1, 2}}},
+    {{{1, 0}, {2, 0}, {1, 1}, {2, 1}}, {{1, 0}, {2, 0}, {1, 1}, {2, 1}}, {{1, 0}, {2, 0}, {1, 1}, {2, 1}}, {{1, 0}, {2, 0}, {1, 1}, {2, 1}}},
+    {{{1, 0}, {2, 0}, {0, 1}, {1, 1}}, {{1, 0}, {1, 1}, {2, 1}, {2, 2}}, {{1, 1}, {2, 1}, {0, 2}, {1, 2}}, {{0, 0}, {0, 1}, {1, 1}, {1, 2}}},
+    {{{1, 0}, {0, 1}, {1, 1}, {2, 1}}, {{1, 0}, {1, 1}, {2, 1}, {1, 2}}, {{0, 1}, {1, 1}, {2, 1}, {1, 2}}, {{1, 0}, {0, 1}, {1, 1}, {1, 2}}},
+    {{{0, 0}, {1, 0}, {1, 1}, {2, 1}}, {{2, 0}, {1, 1}, {2, 1}, {1, 2}}, {{0, 1}, {1, 1}, {1, 2}, {2, 2}}, {{1, 0}, {0, 1}, {1, 1}, {0, 2}}},
+};
 
 constexpr uint8_t glyphFor(char c) {
     return static_cast<uint8_t>(c);
@@ -65,12 +128,24 @@ const uint8_t* getGlyph(char c) {
             static const uint8_t glyph[] = {0x1E, 0x05, 0x05, 0x1E, 0x00};
             return glyph;
         }
+        case 'B': {
+            static const uint8_t glyph[] = {0x1F, 0x15, 0x15, 0x0A, 0x00};
+            return glyph;
+        }
         case 'C': {
             static const uint8_t glyph[] = {0x0E, 0x11, 0x11, 0x11, 0x00};
             return glyph;
         }
+        case 'D': {
+            static const uint8_t glyph[] = {0x1F, 0x11, 0x11, 0x0E, 0x00};
+            return glyph;
+        }
         case 'E': {
             static const uint8_t glyph[] = {0x1F, 0x15, 0x15, 0x11, 0x00};
+            return glyph;
+        }
+        case 'F': {
+            static const uint8_t glyph[] = {0x1F, 0x05, 0x05, 0x01, 0x00};
             return glyph;
         }
         case 'G': {
@@ -121,6 +196,10 @@ const uint8_t* getGlyph(char c) {
             static const uint8_t glyph[] = {0x01, 0x1F, 0x01, 0x00, 0x00};
             return glyph;
         }
+        case 'U': {
+            static const uint8_t glyph[] = {0x0F, 0x10, 0x10, 0x0F, 0x00};
+            return glyph;
+        }
         case 'W': {
             static const uint8_t glyph[] = {0x1F, 0x08, 0x04, 0x08, 0x1F};
             return glyph;
@@ -167,6 +246,10 @@ const uint8_t* getGlyph(char c) {
         }
         case ':': {
             static const uint8_t glyph[] = {0x00, 0x0A, 0x00, 0x00, 0x00};
+            return glyph;
+        }
+        case '>': {
+            static const uint8_t glyph[] = {0x00, 0x11, 0x0A, 0x04, 0x00};
             return glyph;
         }
         case ' ': {
@@ -264,7 +347,6 @@ void flushDisplay() {
 void initDisplay() {
     Wire.begin(kOledSdaPin, kOledSclPin);
     delay(50);
-
     oledCommand(0xAE);
     oledCommand(0xD5);
     oledCommand(0x80);
@@ -288,7 +370,6 @@ void initDisplay() {
     oledCommand(0xA4);
     oledCommand(0xA6);
     oledCommand(0xAF);
-
     clearBuffer();
     flushDisplay();
     gDisplayReady = true;
@@ -319,51 +400,77 @@ ControllerPtr activeGamepad() {
     return nullptr;
 }
 
-bool isOpposite(Direction a, Direction b) {
-    return (a == Direction::Up && b == Direction::Down) || (a == Direction::Down && b == Direction::Up) ||
-           (a == Direction::Left && b == Direction::Right) || (a == Direction::Right && b == Direction::Left);
+InputState readInput(ControllerPtr ctl) {
+    InputState input;
+    if (!ctl) {
+        return input;
+    }
+    const int axisX = ctl->axisX();
+    const int axisY = ctl->axisY();
+    input.up = (ctl->dpad() & DPAD_UP) || axisY < -300;
+    input.down = (ctl->dpad() & DPAD_DOWN) || axisY > 300;
+    input.left = (ctl->dpad() & DPAD_LEFT) || axisX < -300;
+    input.right = (ctl->dpad() & DPAD_RIGHT) || axisX > 300;
+    input.a = ctl->a();
+    input.b = ctl->b();
+    input.start = ctl->miscButtons() != 0;
+    return input;
+}
+
+bool pressed(bool current, bool previous) {
+    return current && !previous;
+}
+
+void setScreen(Screen screen) {
+    gScreen = screen;
+    gScreenDirty = true;
+    gPreviousInput = {};
 }
 
 bool pointEquals(const Point& a, const Point& b) {
     return a.x == b.x && a.y == b.y;
 }
 
+bool isOpposite(Direction a, Direction b) {
+    return (a == Direction::Up && b == Direction::Down) || (a == Direction::Down && b == Direction::Up) ||
+           (a == Direction::Left && b == Direction::Right) || (a == Direction::Right && b == Direction::Left);
+}
+
 bool snakeOccupies(const Point& p, int length) {
     for (int i = 0; i < length; ++i) {
-        if (pointEquals(gGame.body[i], p)) {
+        if (pointEquals(gSnake.body[i], p)) {
             return true;
         }
     }
     return false;
 }
 
-void spawnFood() {
-    const uint32_t start = millis();
+void spawnSnakeFood() {
     Point candidate{};
     do {
-        candidate.x = random(0, kGridWidth);
-        candidate.y = random(0, kGridHeight);
-    } while (snakeOccupies(candidate, gGame.length) && millis() - start < 1000);
-    gGame.food = candidate;
+        candidate.x = random(0, kSnakeGridWidth);
+        candidate.y = random(0, kSnakeGridHeight);
+    } while (snakeOccupies(candidate, gSnake.length));
+    gSnake.food = candidate;
 }
 
-void resetGame() {
-    gGame.length = 4;
-    gGame.body[0] = {12, 8};
-    gGame.body[1] = {11, 8};
-    gGame.body[2] = {10, 8};
-    gGame.body[3] = {9, 8};
-    gGame.direction = Direction::Right;
-    gGame.pendingDirection = Direction::Right;
-    gGame.alive = true;
-    gGame.started = false;
-    gGame.lastStepMs = millis();
-    gGame.score = 0;
-    gGameOverTonePlayed = false;
-    spawnFood();
+void resetSnake() {
+    gSnake.length = 4;
+    gSnake.body[0] = {12, 8};
+    gSnake.body[1] = {11, 8};
+    gSnake.body[2] = {10, 8};
+    gSnake.body[3] = {9, 8};
+    gSnake.direction = Direction::Right;
+    gSnake.pendingDirection = Direction::Right;
+    gSnake.alive = true;
+    gSnake.started = false;
+    gSnake.gameOverTonePlayed = false;
+    gSnake.lastStepMs = millis();
+    gSnake.score = 0;
+    spawnSnakeFood();
 }
 
-void drawCell(const Point& p, bool filled) {
+void drawSnakeCell(const Point& p, bool filled) {
     const int x = p.x * kCellSize;
     const int y = p.y * kCellSize;
     if (filled) {
@@ -373,125 +480,53 @@ void drawCell(const Point& p, bool filled) {
     }
 }
 
-void renderWaitingScreen() {
+void renderSnake() {
     clearBuffer();
     drawRect(0, 0, kDisplayWidth, kDisplayHeight);
-    drawText(13, 14, "AWAITING", 2);
-    drawText(7, 34, "CONTROLLER", 2);
-    drawText(28, 56, "SNAKE", 1);
-    flushDisplay();
-}
-
-void renderGame() {
-    clearBuffer();
-
-    for (int x = 0; x < kDisplayWidth; ++x) {
-        drawPixel(x, 0);
-        drawPixel(x, kDisplayHeight - 1);
-    }
-    for (int y = 0; y < kDisplayHeight; ++y) {
-        drawPixel(0, y);
-        drawPixel(kDisplayWidth - 1, y);
-    }
-
     drawText(4, 2, "S:");
     char scoreText[8];
-    snprintf(scoreText, sizeof(scoreText), "%u", gGame.score);
+    snprintf(scoreText, sizeof(scoreText), "%u", gSnake.score);
     drawText(18, 2, scoreText);
-
-    drawCell(gGame.food, true);
-
-    for (int i = gGame.length - 1; i >= 0; --i) {
-        drawCell(gGame.body[i], i == 0);
+    drawSnakeCell(gSnake.food, true);
+    for (int i = gSnake.length - 1; i >= 0; --i) {
+        drawSnakeCell(gSnake.body[i], i == 0);
     }
-
-    if (!gGame.alive) {
-        fillRect(14, 22, 100, 20, false);
-        drawText(22, 26, "GAME", 2);
-        drawText(70, 26, "OVER", 2);
-        drawText(20, 48, "A TO RESTART", 1);
-    } else if (!gGame.started) {
+    if (!gSnake.alive) {
+        drawText(22, 22, "GAME", 2);
+        drawText(70, 22, "OVER", 2);
+        drawText(12, 48, "A RESTART B BACK", 1);
+    } else if (!gSnake.started) {
         drawText(18, 56, "PRESS DPAD", 1);
     }
-
     flushDisplay();
 }
 
-void drawWaitingIfNeeded() {
-    if (!gDisplayReady || !gWaitingScreenDirty) {
-        return;
-    }
-    renderWaitingScreen();
-    gWaitingScreenDirty = false;
-}
-
-void onConnectedController(ControllerPtr ctl) {
-    for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
-        if (gControllers[i] == nullptr) {
-            ControllerProperties properties = ctl->getProperties();
-            Console.printf("Controller connected, index=%d, VID=0x%04x, PID=0x%04x\n", i, properties.vendor_id,
-                           properties.product_id);
-            gControllers[i] = ctl;
-            gWaitingScreenDirty = true;
-            beep(1760, 60);
-            return;
-        }
-    }
-    Console.println("Controller connected, but there are no free slots");
-}
-
-void onDisconnectedController(ControllerPtr ctl) {
-    for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
-        if (gControllers[i] == ctl) {
-            Console.printf("Controller disconnected from index=%d\n", i);
-            gControllers[i] = nullptr;
-            gWaitingScreenDirty = true;
-            resetGame();
-            beep(220, 180);
-            return;
-        }
-    }
-}
-
-void updateDirectionFromController(ControllerPtr ctl) {
-    if (!ctl) {
-        return;
-    }
-
-    Direction candidate = gGame.pendingDirection;
-    const int axisX = ctl->axisX();
-    const int axisY = ctl->axisY();
-
-    if (ctl->dpad() & DPAD_UP || axisY < -300) {
+void updateSnakeDirection(const InputState& input) {
+    Direction candidate = gSnake.pendingDirection;
+    if (input.up) {
         candidate = Direction::Up;
-    } else if (ctl->dpad() & DPAD_DOWN || axisY > 300) {
+    } else if (input.down) {
         candidate = Direction::Down;
-    } else if (ctl->dpad() & DPAD_LEFT || axisX < -300) {
+    } else if (input.left) {
         candidate = Direction::Left;
-    } else if (ctl->dpad() & DPAD_RIGHT || axisX > 300) {
+    } else if (input.right) {
         candidate = Direction::Right;
     }
-
-    if (!isOpposite(candidate, gGame.direction)) {
-        gGame.pendingDirection = candidate;
+    if (!isOpposite(candidate, gSnake.direction)) {
+        gSnake.pendingDirection = candidate;
     }
-
-    if (!gGame.started && candidate != gGame.direction) {
-        gGame.started = true;
-    }
-    if (!gGame.started && (ctl->dpad() != 0 || abs(axisX) > 300 || abs(axisY) > 300)) {
-        gGame.started = true;
+    if (!gSnake.started && (input.up || input.down || input.left || input.right)) {
+        gSnake.started = true;
     }
 }
 
-void stepGame() {
-    if (!gGame.alive || !gGame.started) {
+void stepSnake() {
+    if (!gSnake.alive || !gSnake.started) {
         return;
     }
-
-    gGame.direction = gGame.pendingDirection;
-    Point next = gGame.body[0];
-    switch (gGame.direction) {
+    gSnake.direction = gSnake.pendingDirection;
+    Point next = gSnake.body[0];
+    switch (gSnake.direction) {
         case Direction::Up:
             --next.y;
             break;
@@ -505,65 +540,298 @@ void stepGame() {
             ++next.x;
             break;
     }
-
-    if (next.x < 0 || next.x >= kGridWidth || next.y < 0 || next.y >= kGridHeight) {
-        gGame.alive = false;
+    if (next.x < 0 || next.x >= kSnakeGridWidth || next.y < 0 || next.y >= kSnakeGridHeight) {
+        gSnake.alive = false;
         return;
     }
-
-    for (int i = 0; i < gGame.length; ++i) {
-        if (pointEquals(next, gGame.body[i])) {
-            gGame.alive = false;
+    for (int i = 0; i < gSnake.length; ++i) {
+        if (pointEquals(next, gSnake.body[i])) {
+            gSnake.alive = false;
             return;
         }
     }
-
-    const bool ateFood = pointEquals(next, gGame.food);
-    const int newLength = min(gGame.length + (ateFood ? 1 : 0), kMaxSnakeLength);
+    const bool ateFood = pointEquals(next, gSnake.food);
+    const int newLength = min(gSnake.length + (ateFood ? 1 : 0), kMaxSnakeLength);
     for (int i = newLength - 1; i > 0; --i) {
-        gGame.body[i] = gGame.body[i - 1];
+        gSnake.body[i] = gSnake.body[i - 1];
     }
-    gGame.body[0] = next;
-    gGame.length = newLength;
-
+    gSnake.body[0] = next;
+    gSnake.length = newLength;
     if (ateFood) {
-        ++gGame.score;
-        spawnFood();
+        ++gSnake.score;
+        spawnSnakeFood();
         beep(1320, 35);
     }
 }
 
-void handleGamepadButtons(ControllerPtr ctl) {
-    if (!ctl) {
+void runSnake(const InputState& input) {
+    if (pressed(input.b, gPreviousInput.b) || pressed(input.start, gPreviousInput.start)) {
+        setScreen(Screen::Menu);
         return;
     }
-
-    if (!gGame.alive && ctl->a()) {
-        resetGame();
+    if (!gSnake.alive && pressed(input.a, gPreviousInput.a)) {
+        resetSnake();
         beep(880, 50);
-        delay(80);
+        delay(70);
         beep(1320, 50);
     }
-}
-
-void runSnakeFrame(ControllerPtr ctl) {
-    updateDirectionFromController(ctl);
-    handleGamepadButtons(ctl);
-
+    updateSnakeDirection(input);
     const uint32_t now = millis();
-    if (now - gGame.lastStepMs >= kStepIntervalMs) {
-        gGame.lastStepMs = now;
-        stepGame();
+    if (now - gSnake.lastStepMs >= kSnakeStepMs) {
+        gSnake.lastStepMs = now;
+        stepSnake();
     }
-
-    if (!gGame.alive && !gGameOverTonePlayed) {
-        gGameOverTonePlayed = true;
+    if (!gSnake.alive && !gSnake.gameOverTonePlayed) {
+        gSnake.gameOverTonePlayed = true;
         beep(330, 120);
         delay(40);
         beep(180, 180);
     }
+    renderSnake();
+}
 
-    renderGame();
+bool tetrisCollision(const Piece& piece, int x, int y, int rotation) {
+    for (int i = 0; i < 4; ++i) {
+        const int px = x + kTetrominoes[piece.type][rotation][i][0];
+        const int py = y + kTetrominoes[piece.type][rotation][i][1];
+        if (px < 0 || px >= kTetrisBoardWidth || py < 0 || py >= kTetrisBoardHeight) {
+            return true;
+        }
+        if (gTetris.board[py][px]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void spawnTetrisPiece() {
+    gTetris.piece.type = random(0, 7);
+    gTetris.piece.rotation = 0;
+    gTetris.piece.x = 3;
+    gTetris.piece.y = 0;
+    if (tetrisCollision(gTetris.piece, gTetris.piece.x, gTetris.piece.y, gTetris.piece.rotation)) {
+        gTetris.alive = false;
+    }
+}
+
+void resetTetris() {
+    memset(gTetris.board, 0, sizeof(gTetris.board));
+    gTetris.score = 0;
+    gTetris.alive = true;
+    gTetris.started = false;
+    gTetris.gameOverTonePlayed = false;
+    gTetris.lastFallMs = millis();
+    gTetris.lastSoftDropMs = millis();
+    spawnTetrisPiece();
+}
+
+void drawTetrisBlock(int bx, int by, bool filled) {
+    const int x = kTetrisBoardX + bx * kTetrisCellSize;
+    const int y = kTetrisBoardY + by * kTetrisCellSize;
+    if (filled) {
+        fillRect(x, y, kTetrisCellSize - 1, kTetrisCellSize - 1);
+    } else {
+        drawRect(x, y, kTetrisCellSize - 1, kTetrisCellSize - 1);
+    }
+}
+
+void renderTetris() {
+    clearBuffer();
+    drawRect(kTetrisBoardX - 2, kTetrisBoardY - 2, kTetrisBoardWidth * kTetrisCellSize + 3,
+             kTetrisBoardHeight * kTetrisCellSize + 3);
+    for (int y = 0; y < kTetrisBoardHeight; ++y) {
+        for (int x = 0; x < kTetrisBoardWidth; ++x) {
+            if (gTetris.board[y][x]) {
+                drawTetrisBlock(x, y, true);
+            }
+        }
+    }
+    if (gTetris.alive) {
+        for (int i = 0; i < 4; ++i) {
+            const int px = gTetris.piece.x + kTetrominoes[gTetris.piece.type][gTetris.piece.rotation][i][0];
+            const int py = gTetris.piece.y + kTetrominoes[gTetris.piece.type][gTetris.piece.rotation][i][1];
+            if (py >= 0) {
+                drawTetrisBlock(px, py, true);
+            }
+        }
+    }
+    drawText(58, 6, "TETRIS", 1);
+    drawText(58, 18, "S:", 1);
+    char scoreText[10];
+    snprintf(scoreText, sizeof(scoreText), "%lu", static_cast<unsigned long>(gTetris.score));
+    drawText(70, 18, scoreText, 1);
+    if (!gTetris.alive) {
+        drawText(58, 34, "GAME", 1);
+        drawText(58, 44, "OVER", 1);
+        drawText(58, 54, "A/B", 1);
+    } else if (!gTetris.started) {
+        drawText(58, 34, "A ROT", 1);
+        drawText(58, 44, "B BACK", 1);
+    }
+    flushDisplay();
+}
+
+void lockTetrisPiece() {
+    for (int i = 0; i < 4; ++i) {
+        const int px = gTetris.piece.x + kTetrominoes[gTetris.piece.type][gTetris.piece.rotation][i][0];
+        const int py = gTetris.piece.y + kTetrominoes[gTetris.piece.type][gTetris.piece.rotation][i][1];
+        if (py >= 0 && py < kTetrisBoardHeight && px >= 0 && px < kTetrisBoardWidth) {
+            gTetris.board[py][px] = 1;
+        }
+    }
+    int cleared = 0;
+    for (int y = kTetrisBoardHeight - 1; y >= 0; --y) {
+        bool full = true;
+        for (int x = 0; x < kTetrisBoardWidth; ++x) {
+            if (!gTetris.board[y][x]) {
+                full = false;
+                break;
+            }
+        }
+        if (full) {
+            ++cleared;
+            for (int pull = y; pull > 0; --pull) {
+                memcpy(gTetris.board[pull], gTetris.board[pull - 1], sizeof(gTetris.board[pull]));
+            }
+            memset(gTetris.board[0], 0, sizeof(gTetris.board[0]));
+            ++y;
+        }
+    }
+    if (cleared > 0) {
+        gTetris.score += static_cast<uint32_t>(cleared) * 10U;
+        beep(1560, 35);
+    }
+    spawnTetrisPiece();
+}
+
+void moveTetrisDown() {
+    if (tetrisCollision(gTetris.piece, gTetris.piece.x, gTetris.piece.y + 1, gTetris.piece.rotation)) {
+        lockTetrisPiece();
+    } else {
+        ++gTetris.piece.y;
+    }
+}
+
+void runTetris(const InputState& input) {
+    if (pressed(input.b, gPreviousInput.b) || pressed(input.start, gPreviousInput.start)) {
+        setScreen(Screen::Menu);
+        return;
+    }
+    if (!gTetris.alive && pressed(input.a, gPreviousInput.a)) {
+        resetTetris();
+        beep(880, 40);
+        delay(60);
+        beep(1320, 40);
+    }
+    if (gTetris.alive) {
+        if (pressed(input.left, gPreviousInput.left) &&
+            !tetrisCollision(gTetris.piece, gTetris.piece.x - 1, gTetris.piece.y, gTetris.piece.rotation)) {
+            --gTetris.piece.x;
+            gTetris.started = true;
+        }
+        if (pressed(input.right, gPreviousInput.right) &&
+            !tetrisCollision(gTetris.piece, gTetris.piece.x + 1, gTetris.piece.y, gTetris.piece.rotation)) {
+            ++gTetris.piece.x;
+            gTetris.started = true;
+        }
+        if (pressed(input.a, gPreviousInput.a)) {
+            const int nextRotation = (gTetris.piece.rotation + 1) % 4;
+            if (!tetrisCollision(gTetris.piece, gTetris.piece.x, gTetris.piece.y, nextRotation)) {
+                gTetris.piece.rotation = nextRotation;
+                gTetris.started = true;
+            }
+        }
+        const uint32_t now = millis();
+        if (input.down && now - gTetris.lastSoftDropMs >= kTetrisSoftDropMs) {
+            gTetris.lastSoftDropMs = now;
+            moveTetrisDown();
+            gTetris.started = true;
+        }
+        if (now - gTetris.lastFallMs >= kTetrisFallMs) {
+            gTetris.lastFallMs = now;
+            moveTetrisDown();
+        }
+    }
+    if (!gTetris.alive && !gTetris.gameOverTonePlayed) {
+        gTetris.gameOverTonePlayed = true;
+        beep(300, 120);
+        delay(40);
+        beep(180, 180);
+    }
+    renderTetris();
+}
+
+void renderWaiting() {
+    clearBuffer();
+    drawRect(0, 0, kDisplayWidth, kDisplayHeight);
+    drawText(13, 14, "AWAITING", 2);
+    drawText(7, 34, "CONTROLLER", 2);
+    drawText(16, 56, "CONNECT STADIA", 1);
+    flushDisplay();
+}
+
+void renderMenu() {
+    clearBuffer();
+    drawRect(0, 0, kDisplayWidth, kDisplayHeight);
+    drawText(28, 6, "SELECT", 2);
+    drawText(40, 22, "GAME", 2);
+    drawText(16, 44, gMenuItem == MenuItem::Snake ? "> SNAKE" : "  SNAKE", 1);
+    drawText(16, 54, gMenuItem == MenuItem::Tetris ? "> TETRIS" : "  TETRIS", 1);
+    flushDisplay();
+}
+
+void onConnectedController(ControllerPtr ctl) {
+    for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
+        if (gControllers[i] == nullptr) {
+            ControllerProperties properties = ctl->getProperties();
+            Console.printf("Controller connected, index=%d, VID=0x%04x, PID=0x%04x\n", i, properties.vendor_id,
+                           properties.product_id);
+            gControllers[i] = ctl;
+            beep(1760, 50);
+            if (gScreen == Screen::Waiting) {
+                setScreen(Screen::Menu);
+            } else {
+                gScreenDirty = true;
+            }
+            return;
+        }
+    }
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+    for (int i = 0; i < BP32_MAX_GAMEPADS; ++i) {
+        if (gControllers[i] == ctl) {
+            gControllers[i] = nullptr;
+            Console.printf("Controller disconnected from index=%d\n", i);
+            resetSnake();
+            resetTetris();
+            beep(220, 140);
+            setScreen(Screen::Waiting);
+            return;
+        }
+    }
+}
+
+void runMenu(const InputState& input) {
+    if (pressed(input.up, gPreviousInput.up) || pressed(input.down, gPreviousInput.down)) {
+        gMenuItem = (gMenuItem == MenuItem::Snake) ? MenuItem::Tetris : MenuItem::Snake;
+        beep(1240, 20);
+        gScreenDirty = true;
+    }
+    if (pressed(input.a, gPreviousInput.a)) {
+        beep(1560, 30);
+        if (gMenuItem == MenuItem::Snake) {
+            resetSnake();
+            setScreen(Screen::Snake);
+        } else {
+            resetTetris();
+            setScreen(Screen::Tetris);
+        }
+    }
+    if (gScreenDirty) {
+        renderMenu();
+        gScreenDirty = false;
+    }
 }
 
 }  // namespace
@@ -571,10 +839,10 @@ void runSnakeFrame(ControllerPtr ctl) {
 void setup() {
     delay(200);
     randomSeed(esp_random());
-
     initDisplay();
     initBuzzer();
-    resetGame();
+    resetSnake();
+    resetTetris();
 
     Console.printf("Firmware: %s\n", BP32.firmwareVersion());
     const uint8_t* addr = BP32.localBdAddress();
@@ -584,7 +852,7 @@ void setup() {
     BP32.enableVirtualDevice(false);
     BP32.enableBLEService(false);
 
-    renderWaitingScreen();
+    renderWaiting();
 }
 
 void loop() {
@@ -592,12 +860,31 @@ void loop() {
 
     ControllerPtr controller = activeGamepad();
     if (!controller) {
-        drawWaitingIfNeeded();
+        if (gScreen != Screen::Waiting || gScreenDirty) {
+            setScreen(Screen::Waiting);
+            renderWaiting();
+            gScreenDirty = false;
+        }
         delay(30);
         return;
     }
 
-    gWaitingScreenDirty = true;
-    runSnakeFrame(controller);
+    const InputState input = readInput(controller);
+    switch (gScreen) {
+        case Screen::Waiting:
+            setScreen(Screen::Menu);
+            break;
+        case Screen::Menu:
+            runMenu(input);
+            break;
+        case Screen::Snake:
+            runSnake(input);
+            break;
+        case Screen::Tetris:
+            runTetris(input);
+            break;
+    }
+
+    gPreviousInput = input;
     delay(20);
 }
